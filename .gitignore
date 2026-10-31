@@ -274,5 +274,8 @@ Thumbs.db
 # Astropipeline -------------------------------------
 images/
 data/
+output/
+
+
 
 
