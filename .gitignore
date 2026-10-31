@@ -271,3 +271,7 @@ Thumbs.db
 .obsidian/plugins/*/.cache/
 .obsidian/plugins/*/node_modules/
 
+# Astropipeline -------------------------------------
+images/
+
+
