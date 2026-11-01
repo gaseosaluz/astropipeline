@@ -6,66 +6,63 @@ from tqdm import tqdm
 from spandrel import ModelLoader
 
 def load_tiff16(filepath: str, device: str = "cuda") -> torch.Tensor:
-    """Loads 16-bit uncompressed TIFF and maps uint16 [0, 65535] to float32 [0.0, 1.0] [1, 3, H, W]."""
     img_np = tifffile.imread(filepath)
     if img_np.dtype != np.uint16:
         raise ValueError(f"Expected uint16 TIFF, got {img_np.dtype}")
     
-    # Standardize shape to (H, W, C)
-    if img_np.ndim == 2:  # Monochrome (H, W) -> replicate to 3 channels for Real-ESRGAN
+    if img_np.ndim == 2:
         img_np = np.stack([img_np] * 3, axis=-1)
-    elif img_np.ndim == 3 and img_np.shape[0] in (1, 3, 4):  # CHW format
+    elif img_np.ndim == 3 and img_np.shape[0] in (1, 3, 4):
         img_np = np.transpose(img_np, (1, 2, 0))
     
-    # Drop alpha channel if present
     if img_np.shape[-1] > 3:
         img_np = img_np[:, :, :3]
     elif img_np.shape[-1] == 1:
         img_np = np.repeat(img_np, 3, axis=-1)
         
     img_float = img_np.astype(np.float32) / 65535.0
-    # Transpose HWC -> CHW -> BCHW [1, 3, H, W]
     return torch.from_numpy(img_float).permute(2, 0, 1).unsqueeze(0).to(device)
 
 def save_tiff16(tensor: torch.Tensor, out_path: str):
-    """Converts normalized float32 tensor back to 16-bit uncompressed TIFF."""
     tensor = tensor.squeeze(0).permute(1, 2, 0).detach().cpu().clamp(0.0, 1.0)
     img_np = (tensor.numpy() * 65535.0).round().astype(np.uint16)
     tifffile.imwrite(out_path, img_np, compression=None)
     print(f"Saved: {out_path} ({img_np.shape[1]}x{img_np.shape[0]}, {img_np.shape[2]} channels, 16-bit)")
 
 def run_tiled_upscale(model_wrapper, tensor: torch.Tensor, tile_size: int = 512, overlap: int = 64) -> torch.Tensor:
-    scale = getattr(model_wrapper.model, 'scale', 2)
     b, c, h, w = tensor.shape
-    stride = tile_size - overlap
     
+    # Dynamically determine exact model scale from a 64x64 probe tile
+    probe = torch.zeros((1, c, 64, 64), device=tensor.device)
+    with torch.no_grad():
+        probe_out = model_wrapper(probe)
+    scale = probe_out.shape[-1] // 64
+    print(f"Detected true model upscale factor: {scale}x")
+    
+    stride = tile_size - overlap
     out_h = h * scale
     out_w = w * scale
     
     output = torch.zeros((b, c, out_h, out_w), device=tensor.device, dtype=torch.float32)
     weights = torch.zeros((1, 1, out_h, out_w), device=tensor.device, dtype=torch.float32)
     
-    y_starts = list(range(0, max(1, h - overlap), stride))
-    x_starts = list(range(0, max(1, w - overlap), stride))
+    y_starts = list(range(0, h, stride))
+    x_starts = list(range(0, w, stride))
     
     with torch.no_grad():
         for y in tqdm(y_starts, desc="Tiled Inference"):
-            y_end = min(y + tile_size, h)
-            y_start = max(0, y_end - tile_size)
+            y_start = min(y, max(0, h - tile_size))
+            y_end = min(y_start + tile_size, h)
             
             for x in x_starts:
-                x_end = min(x + tile_size, w)
-                x_start = max(0, x_end - tile_size)
+                x_start = min(x, max(0, w - tile_size))
+                x_end = min(x_start + tile_size, w)
                 
                 tile = tensor[:, :, y_start:y_end, x_start:x_end]
-                
-                # Execute model inference on GPU
                 tile_out = model_wrapper(tile)
-                
-                # Retrieve actual output tile spatial dimensions
                 _, _, th_out, tw_out = tile_out.shape
                 
-                # Generate dynamic 2D Bartlett window matching exact tile dimensions
+                # 2D Bartlett blending window
                 win_y = torch.bartlett_window(th_out, periodic=False, device=tensor.device)
                 win_x = torch.bartlett_window(tw_out, periodic=False, device=tensor.device)
                 win2d = (win_y.unsqueeze(1) * win_x.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
@@ -104,3 +101,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
